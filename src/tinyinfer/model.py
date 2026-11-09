@@ -136,7 +136,36 @@ def _ln(x: np.ndarray, weight: np.ndarray, bias: np.ndarray, eps: float) -> np.n
     return c / np.sqrt(np.mean(c * c, axis=-1, keepdims=True) + eps) * weight + bias
 
 
-def inference(model: dict[str, Any], input_ids: list[int], max_new_tokens: int = 32) -> list[int]:
+def sample(logits: "np.ndarray", temperature: float = 1.0, top_k: int | None = None, top_p: float | None = None, rng: "np.random.Generator | None" = None) -> int:
+    """Draw one token id from logits."""
+    rng = rng if rng is not None else np.random.default_rng()
+    scores = np.array(logits, dtype=np.float64, copy=True).ravel()
+    if temperature <= 0:
+        return int(np.argmax(scores))
+    scores /= temperature
+    if top_k is not None and 0 < top_k < scores.size:
+        cutoff = np.partition(scores, -top_k)[-top_k]
+        scores = np.where(scores >= cutoff, scores, -np.inf)
+    if top_p is not None and 0.0 < top_p < 1.0:
+        order = np.argsort(-scores, kind="stable")
+        cumulative = np.cumsum(_softmax(scores[order]))
+        keep = int(np.searchsorted(cumulative, top_p)) + 1
+        filtered = np.full_like(scores, -np.inf)
+        filtered[order[:keep]] = scores[order[:keep]]
+        scores = filtered
+    probs = _softmax(scores)
+    if not np.isfinite(probs).all() or probs.sum() <= 0:
+        return int(np.argmax(logits))
+    return int(rng.choice(probs.size, p=probs / probs.sum()))
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    m = np.where(np.isfinite(x.max()), x.max(), 0.0)
+    e = np.exp(x - m)
+    return e / np.where(e.sum() > 0, e.sum(), 1.0)
+
+
+def inference(model: dict[str, Any], input_ids: list[int], max_new_tokens: int = 32, temperature: float = 1.0, top_k: int | None = None, top_p: float | None = None, seed: int | None = None, eos_token_id: int | None = None, stop_on_eos: bool = True) -> list[int]:
     """Run generation.
 
     Args:
@@ -147,7 +176,28 @@ def inference(model: dict[str, Any], input_ids: list[int], max_new_tokens: int =
     Returns:
         Input + generated token ids.
     """
-    pass
+    cfg = model["config"]
+    n_positions = int(cfg.get("n_positions", cfg.get("n_ctx", 1024)))
+    if eos_token_id is None:
+        eos_token_id = cfg.get("eos_token_id")
+    ids = list(input_ids)
+    if not ids:
+        if eos_token_id is None:
+            raise ValueError("empty prompt needs an eos token to start from")
+        ids = [eos_token_id]
+    if len(ids) >= n_positions:
+        keep = max(1, n_positions - max_new_tokens)
+        ids = ids[-keep:]
+    rng = np.random.default_rng(seed)
+    for _ in range(max_new_tokens):
+        row = forward(model, ids)[-1].astype(np.float64)
+        token = sample(row, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng)
+        ids.append(token)
+        if stop_on_eos and eos_token_id is not None and token == eos_token_id:
+            break
+        if len(ids) >= n_positions:
+            break
+    return ids
 
 def tokenize(input: str) -> list[int]:
     """Encode text to GPT-2 token ids (byte-level BPE).
