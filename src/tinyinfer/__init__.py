@@ -1,8 +1,8 @@
 __version__ = "0.1.0"
 
-from .model import detokenize, download_model, forward, inference, load_model, sample, tokenize
+from .model import detokenize, download_model, forward, generate, inference, load_model, sample, tokenize
 
-__all__ = ["__version__", "detokenize", "download_model", "forward", "inference", "load_model", "main", "sample", "tokenize"]
+__all__ = ["__version__", "detokenize", "download_model", "forward", "generate", "inference", "load_model", "main", "sample", "tokenize"]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -35,5 +35,16 @@ def main(argv: list[str] | None = None) -> None:
         _m._tokenizer_cache = None
     loaded = load_model(snapshot)
     ids = tokenize(args.prompt)
-    out = inference(loaded, ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_k=args.top_k or None, top_p=args.top_p, seed=args.seed)
-    print(detokenize(out))
+    out = sys.stdout
+    out.write(args.prompt)
+    out.flush()
+    stream = _m._StreamDecoder()
+    for tid in generate(loaded, ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_k=args.top_k or None, top_p=args.top_p, seed=args.seed):
+        chunk = stream.push([tid])
+        if chunk:
+            out.write(chunk)
+            out.flush()
+    tail = stream.flush()
+    if tail:
+        out.write(tail)
+    out.write("\n")

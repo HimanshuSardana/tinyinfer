@@ -41,8 +41,13 @@ def download_model(model_id: str, cache_dir: str | Path | None = None) -> Path:
     Returns:
         Local directory containing the snapshot.
     """
-    from huggingface_hub import snapshot_download
+    import os
 
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import disable_progress_bars
+
+    disable_progress_bars()
     allow = ["config.json", "*.safetensors", "*.json", "*.txt"]
     snap = snapshot_download(
         repo_id=model_id,
@@ -80,6 +85,10 @@ def load_model(model_path: str | Path) -> dict[str, Any]:
         # TODO: merge all shards (respect model.safetensors.index.json); cands[0] drops the rest.
         st_file = cands[0]
     weights = load_file(str(st_file))
+    # Contiguous copy of the tied output matrix: wte.T is a strided view and
+    # GEMM repacks its 154MB from RAM on every token when memory-bound.
+    if "wte.weight" in weights:
+        weights["wte.weight.T"] = np.ascontiguousarray(weights["wte.weight"].T)
     return {"config": config, "weights": weights, "path": path}
 
 
@@ -94,6 +103,19 @@ def forward(model: dict[str, Any], input_ids: list[int]) -> "np.ndarray":
         Logits of shape (T, vocab_size), float32.
     """
     cfg = model["config"]
+    n_layer = int(cfg["n_layer"])
+    t = len(input_ids)
+    n_positions = int(cfg.get("n_positions", cfg.get("n_ctx", 1024)))
+    if t > n_positions:
+        raise ValueError(f"sequence of {t} tokens exceeds n_positions={n_positions}")
+    w = model["weights"]
+    if "wte.weight.T" not in w:
+        w["wte.weight.T"] = np.ascontiguousarray(w["wte.weight"].T)
+    return _forward_cached(model, list(input_ids), [None] * n_layer, 0)
+
+
+def _forward_cached(model: dict[str, Any], ids: list[int], caches: list, n_past: int) -> "np.ndarray":
+    cfg = model["config"]
     w = model["weights"]
     n_layer = int(cfg["n_layer"])
     n_head = int(cfg["n_head"])
@@ -101,13 +123,15 @@ def forward(model: dict[str, Any], input_ids: list[int]) -> "np.ndarray":
     n_positions = int(cfg.get("n_positions", cfg.get("n_ctx", 1024)))
     eps = float(cfg.get("layer_norm_epsilon", 1e-5))
     hd = n_embd // n_head
-    t = len(input_ids)
-    if t > n_positions:
-        raise ValueError(f"sequence of {t} tokens exceeds n_positions={n_positions}")
-    x = np.ascontiguousarray(w["wte.weight"][np.asarray(input_ids, dtype=np.int64)], dtype=np.float32)
-    x = x + np.ascontiguousarray(w["wpe.weight"][:t], dtype=np.float32)
-    pos = np.arange(t)
-    mask = np.where(pos[None, :] <= pos[:, None], 0.0, -np.inf).astype(np.float32)
+    scale = 1.0 / np.sqrt(float(hd))
+    t = len(ids)
+    if n_past + t > n_positions:
+        raise ValueError(f"sequence of {n_past + t} tokens exceeds n_positions={n_positions}")
+    x = np.ascontiguousarray(w["wte.weight"][np.asarray(ids, dtype=np.int64)], dtype=np.float32)
+    x = x + np.ascontiguousarray(w["wpe.weight"][n_past:n_past + t], dtype=np.float32)
+    query_pos = np.arange(t) + n_past
+    key_pos = np.arange(n_past + t)
+    mask = np.where(key_pos[None, :] <= query_pos[:, None], 0.0, -np.inf).astype(np.float32)
     for l in range(n_layer):
         p = f"h.{l}."
         h = _ln(x, w[p + "ln_1.weight"], w[p + "ln_1.bias"], eps)
@@ -116,7 +140,22 @@ def forward(model: dict[str, Any], input_ids: list[int]) -> "np.ndarray":
         q = q.reshape(t, n_head, hd).transpose(1, 0, 2)
         k = k.reshape(t, n_head, hd).transpose(1, 0, 2)
         v = v.reshape(t, n_head, hd).transpose(1, 0, 2)
-        s = (q @ k.transpose(0, 2, 1)) / np.sqrt(float(hd)) + mask
+        prev = caches[l]
+        if prev is None:
+            k_cache = np.zeros((n_head, n_positions, hd), dtype=np.float32)
+            v_cache = np.zeros((n_head, n_positions, hd), dtype=np.float32)
+            k_cache[:, n_past:n_past + t, :] = k
+            v_cache[:, n_past:n_past + t, :] = v
+            caches[l] = (k_cache, v_cache, n_past + t)
+            k, v = k_cache[:, :n_past + t, :], v_cache[:, :n_past + t, :]
+        else:
+            k_cache, v_cache, filled = prev
+            k_cache[:, n_past:n_past + t, :] = k
+            v_cache[:, n_past:n_past + t, :] = v
+            filled = n_past + t
+            caches[l] = (k_cache, v_cache, filled)
+            k, v = k_cache[:, :filled, :], v_cache[:, :filled, :]
+        s = (q @ k.transpose(0, 2, 1)) * scale + mask
         s = s - np.where(np.isfinite(s.max(axis=-1, keepdims=True)), s.max(axis=-1, keepdims=True), 0.0)
         e = np.exp(s)
         probs = e / e.sum(axis=-1, keepdims=True)
@@ -128,7 +167,7 @@ def forward(model: dict[str, Any], input_ids: list[int]) -> "np.ndarray":
         fc_out = 0.5 * fc_in * (1.0 + np.tanh(0.7978845608028654 * (fc_in + 0.044715 * fc_in**3)))
         x = x + fc_out @ w[p + "mlp.c_proj.weight"] + w[p + "mlp.c_proj.bias"]
     x = _ln(x, w["ln_f.weight"], w["ln_f.bias"], eps)
-    return (x @ w["wte.weight"].T).astype(np.float32)
+    return (x @ w["wte.weight.T"]).astype(np.float32)
 
 
 def _ln(x: np.ndarray, weight: np.ndarray, bias: np.ndarray, eps: float) -> np.ndarray:
@@ -165,18 +204,7 @@ def _softmax(x: np.ndarray) -> np.ndarray:
     return e / np.where(e.sum() > 0, e.sum(), 1.0)
 
 
-def inference(model: dict[str, Any], input_ids: list[int], max_new_tokens: int = 32, temperature: float = 1.0, top_k: int | None = None, top_p: float | None = None, seed: int | None = None, eos_token_id: int | None = None, stop_on_eos: bool = True) -> list[int]:
-    """Run generation.
-
-    Args:
-        model: Loaded model from load_model.
-        input_ids: Input token ids.
-        max_new_tokens: Tokens to generate.
-
-    Returns:
-        Input + generated token ids.
-    """
-    cfg = model["config"]
+def _prep_ids(cfg: dict[str, Any], input_ids: list[int], max_new_tokens: int, eos_token_id: int | None) -> tuple[list[int], int | None]:
     n_positions = int(cfg.get("n_positions", cfg.get("n_ctx", 1024)))
     if eos_token_id is None:
         eos_token_id = cfg.get("eos_token_id")
@@ -188,15 +216,43 @@ def inference(model: dict[str, Any], input_ids: list[int], max_new_tokens: int =
     if len(ids) >= n_positions:
         keep = max(1, n_positions - max_new_tokens)
         ids = ids[-keep:]
+    return ids, eos_token_id
+
+
+def generate(model: dict[str, Any], input_ids: list[int], max_new_tokens: int = 32, temperature: float = 1.0, top_k: int | None = None, top_p: float | None = None, seed: int | None = None, eos_token_id: int | None = None, stop_on_eos: bool = True):
+    """Yield new token ids one at a time, reusing a KV cache."""
+    cfg = model["config"]
+    n_positions = int(cfg.get("n_positions", cfg.get("n_ctx", 1024)))
+    n_layer = int(cfg["n_layer"])
+    ids, eos_token_id = _prep_ids(cfg, input_ids, max_new_tokens, eos_token_id)
     rng = np.random.default_rng(seed)
+    caches: list = [None] * n_layer
+    logits = _forward_cached(model, ids, caches, 0)[-1].astype(np.float64)
+    n_past = len(ids)
     for _ in range(max_new_tokens):
-        row = forward(model, ids)[-1].astype(np.float64)
-        token = sample(row, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng)
-        ids.append(token)
+        token = sample(logits, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng)
+        yield token
         if stop_on_eos and eos_token_id is not None and token == eos_token_id:
-            break
-        if len(ids) >= n_positions:
-            break
+            return
+        if n_past >= n_positions:
+            return
+        logits = _forward_cached(model, [token], caches, n_past)[-1].astype(np.float64)
+        n_past += 1
+
+
+def inference(model: dict[str, Any], input_ids: list[int], max_new_tokens: int = 32, temperature: float = 1.0, top_k: int | None = None, top_p: float | None = None, seed: int | None = None, eos_token_id: int | None = None, stop_on_eos: bool = True) -> list[int]:
+    """Run generation.
+
+    Args:
+        model: Loaded model from load_model.
+        input_ids: Input token ids.
+        max_new_tokens: Tokens to generate.
+
+    Returns:
+        Input + generated token ids.
+    """
+    ids, _ = _prep_ids(model["config"], input_ids, max_new_tokens, eos_token_id)
+    ids.extend(generate(model, ids, max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k, top_p=top_p, seed=seed, eos_token_id=eos_token_id, stop_on_eos=stop_on_eos))
     return ids
 
 def tokenize(input: str) -> list[int]:
@@ -270,10 +326,14 @@ def detokenize(input: list[int]) -> str:
         Decoded string.
     """
     tok = _get_tokenizer()
+    return _ids_to_bytes(tok, input).decode("utf-8", errors="replace")
+
+
+def _ids_to_bytes(tok: dict[str, Any], ids: list[int]) -> bytes:
     decoder: dict[int, str] = tok["decoder"]
     byte_decoder: dict[str, int] = tok["byte_decoder"]
     raw = bytearray()
-    for i in input:
+    for i in ids:
         text = decoder.get(i)
         if text is None:
             continue
@@ -283,7 +343,34 @@ def detokenize(input: list[int]) -> str:
                 raw.extend(ch.encode("utf-8"))
             else:
                 raw.append(b)
-    return bytes(raw).decode("utf-8", errors="replace")
+    return bytes(raw)
+
+
+class _StreamDecoder:
+    """Incremental decoder: push ids, get text as soon as bytes complete."""
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+
+    def push(self, ids: list[int]) -> str:
+        self._pending.extend(_ids_to_bytes(_get_tokenizer(), ids))
+        try:
+            text = bytes(self._pending).decode("utf-8")
+            del self._pending[:]
+            return text
+        except UnicodeDecodeError as exc:
+            if exc.reason != "unexpected end of data":
+                text = bytes(self._pending).decode("utf-8", errors="replace")
+                self._pending.clear()
+                return text
+            text = bytes(self._pending[: exc.start]).decode("utf-8", errors="replace")
+            del self._pending[: exc.start]
+            return text
+
+    def flush(self) -> str:
+        text = bytes(self._pending).decode("utf-8", errors="replace")
+        self._pending.clear()
+        return text
 
 
 def _get_tokenizer() -> dict[str, Any]:
