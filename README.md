@@ -97,31 +97,6 @@ Each SSE frame carries `{"token_id", "text", "n"}`, a final `{"done": true, "tok
 
 Model weights load once at startup and a generation lock keeps concurrent requests from interleaving KV cache state.
 
-## API
-
-| Function | Purpose |
-| --- | --- |
-| `download_model(model_id, cache_dir=None)` | Snapshot a Hub repo, returns the local `Path` |
-| `load_model(path)` | Read `config.json` and `*.safetensors` into config and weights |
-| `forward(model, input_ids)` | Logits of shape `(T, vocab_size)` |
-| `generate(model, ...)` | Generator yielding new token ids, reuses a KV cache |
-| `inference(model, ...)` | Same, but returns the full id list at once |
-| `sample(logits, ...)` | Draw one id with temperature, top-k, top-p |
-| `tokenize(text)` / `detokenize(ids)` | GPT-2 byte-level BPE encode and decode |
-
-`generate` and `inference` accept `max_new_tokens`, `temperature`, `top_k`, `top_p`, `seed`, `eos_token_id`, and `stop_on_eos`.
-
-## Project layout
-
-```
-src/tinyinfer/
-  __init__.py    CLI entry point (tinyinfer command)
-  model.py       tokenizer, model IO, forward pass, sampling, generation
-server.py        stdlib HTTP server with SSE streaming
-web/index.html   single-file web UI
-tests/           model IO and smoke tests
-```
-
 ## Tests
 
 ```bash
